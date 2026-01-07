@@ -1,0 +1,265 @@
+name: Build boot.img (maple / msm8998, gcc6)
+
+on:
+  push:
+    branches: [ "lineage-21", "main", "master" ]
+  workflow_dispatch:
+    inputs:
+      device_ref:
+        description: "android_device_sony_maple ref (optional)"
+        required: false
+        default: "lineage-21"
+      ramdisk_path:
+        description: "Path to ramdisk cpio in THIS kernel repo"
+        required: false
+        default: "configs/ramdisk.cpio"
+
+      # Optional overrides
+      cmdline:
+        description: "Override mkbootimg --cmdline"
+        required: false
+        default: "ehci-hcd.park=3 lpm_levels.sleep_disabled=1 sched_enable_hmp=0 sched_enable_power_aware=1 service_locator.enable=1 swiotlb=2048 androidboot.configfs=true androidboot.usbcontroller=a800000.dwc3 loop.max_part=7 androidboot.hardware=maple buildvariant=userdebug"
+      os_version:
+        description: "Override mkbootimg --os_version"
+        required: false
+        default: "13.0.0"
+      os_patch_level:
+        description: "Override mkbootimg --os_patch_level"
+        required: false
+        default: "2023-12"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      CROSS_COMPILE_ARM32: arm-eabi-
+
+      CCACHE_DIR: "${{ github.workspace }}/.ccache"
+      CCACHE_COMPRESS: "true"
+      CCACHE_MAXSIZE: "2G"
+
+      # Stock boot.img layout (from your header parse)
+      STOCK_HEADER_VERSION: "0"
+      STOCK_PAGESIZE: "4096"
+      STOCK_BASE: "0x00000000"
+      STOCK_KERNEL_OFFSET: "0x00008000"
+      STOCK_RAMDISK_OFFSET: "0x01000000"
+      STOCK_TAGS_OFFSET: "0x00000100"
+
+    steps:
+      - name: Checkout kernel repo (this)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Checkout device repo (maple) (optional)
+        uses: actions/checkout@v4
+        with:
+          repository: baozi977/android_device_sony_maple
+          ref: ${{ github.event.inputs.device_ref || 'lineage-21' }}
+          path: device/sony/maple
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex make git \
+            libssl-dev libelf-dev libncurses-dev \
+            python3 xz-utils cpio gzip zip curl wget \
+            ccache mkbootimg device-tree-compiler
+
+      # ===== Cache: toolchains (GCC 6.x aarch64 + arm-eabi) =====
+      - name: Cache GCC 6.x toolchains
+        id: cache-toolchains
+        uses: actions/cache@v4
+        with:
+          path: toolchains
+          key: toolchains-${{ runner.os }}-linaro-gcc-6.3.1-2017.02-v2
+
+      - name: Download toolchains (Linaro GCC 6.3.1 2017.02) with progress
+        if: steps.cache-toolchains.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          mkdir -p toolchains
+          cd toolchains
+
+          # Show progress + add timeout/retry to avoid "silent waiting"
+          WGET="wget --progress=dot:giga --timeout=30 --tries=10 --waitretry=5 --retry-connrefused -O"
+
+          $WGET gcc-linaro-aarch64.tar.xz \
+            https://releases.linaro.org/components/toolchain/binaries/6.3-2017.02/aarch64-linux-gnu/gcc-linaro-6.3.1-2017.02-x86_64_aarch64-linux-gnu.tar.xz
+
+          $WGET gcc-linaro-arm-eabi.tar.xz \
+            https://releases.linaro.org/components/toolchain/binaries/6.3-2017.02/arm-eabi/gcc-linaro-6.3.1-2017.02-x86_64_arm-eabi.tar.xz
+
+          ls -lah *.tar.xz
+
+          # Quick integrity check (fails fast if corrupted)
+          tar -tJf gcc-linaro-aarch64.tar.xz >/dev/null
+          tar -tJf gcc-linaro-arm-eabi.tar.xz >/dev/null
+
+          tar -xJf gcc-linaro-aarch64.tar.xz
+          tar -xJf gcc-linaro-arm-eabi.tar.xz
+
+      # ✅ Fix: make PATH effective in THIS step and later steps
+      - name: Add toolchains + ccache to PATH (effective now)
+        run: |
+          set -eux
+
+          A64_TC="${GITHUB_WORKSPACE}/toolchains/gcc-linaro-6.3.1-2017.02-x86_64_aarch64-linux-gnu/bin"
+          A32_TC="${GITHUB_WORKSPACE}/toolchains/gcc-linaro-6.3.1-2017.02-x86_64_arm-eabi/bin"
+
+          # For subsequent steps
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          echo "$A64_TC" >> "$GITHUB_PATH"
+          echo "$A32_TC" >> "$GITHUB_PATH"
+
+          # For current step
+          export PATH="/usr/lib/ccache:$A64_TC:$A32_TC:$PATH"
+
+          which aarch64-linux-gnu-gcc
+          which arm-eabi-gcc
+          aarch64-linux-gnu-gcc --version | head
+          arm-eabi-gcc --version | head
+          ccache -s || true
+
+      # ===== Cache: ccache =====
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-${{ hashFiles('configs/my.config') }}-${{ github.ref_name }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ hashFiles('configs/my.config') }}-
+            ccache-${{ runner.os }}-
+
+      - name: Configure (configs/my.config + olddefconfig)
+        run: |
+          set -eux
+          test -f configs/my.config
+          mkdir -p out
+          cp -v configs/my.config out/.config
+
+          make O=out ARCH="${ARCH}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" \
+            olddefconfig
+
+          echo "===== .config (head) ====="
+          head -n 80 out/.config || true
+
+      - name: Build kernel + dtbs (strict, with log)
+        run: |
+          set -eo pipefail
+          KCFLAGS_FIX="-Wno-error -Wno-error=unused-value -Wno-error=misleading-indentation"
+
+          echo "===== Build (Image.gz-dtb -> Image.gz -> Image) =====" | tee build.log
+
+          KERNEL_IMG=""
+          for tgt in Image.gz-dtb Image.gz Image; do
+            echo "---- make ${tgt} ----" | tee -a build.log
+            if make -j"$(nproc)" O=out ARCH="${ARCH}" \
+                 CROSS_COMPILE="${CROSS_COMPILE}" \
+                 CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" \
+                 KCFLAGS="${KCFLAGS_FIX}" \
+                 "${tgt}" 2>&1 | tee -a build.log; then
+              if [ -f "out/arch/arm64/boot/${tgt}" ]; then
+                KERNEL_IMG="out/arch/arm64/boot/${tgt}"
+                break
+              fi
+            fi
+          done
+
+          if [ -z "$KERNEL_IMG" ]; then
+            echo "ERROR: kernel image not produced." | tee -a build.log
+            exit 1
+          fi
+
+          echo "KERNEL_IMG=$KERNEL_IMG" | tee -a build.log
+          echo "KERNEL_IMG=$KERNEL_IMG" >> "$GITHUB_ENV"
+
+          echo "===== Build dtbs =====" | tee -a build.log
+          make -j"$(nproc)" O=out ARCH="${ARCH}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" \
+            KCFLAGS="${KCFLAGS_FIX}" \
+            dtbs 2>&1 | tee -a build.log
+
+          echo "===== out/arch/arm64/boot (ls) =====" | tee -a build.log
+          ls -lah out/arch/arm64/boot | tee -a build.log || true
+
+      - name: Prepare ramdisk (cpio -> gz)
+        run: |
+          set -eux
+          RAMDISK="${{ github.event.inputs.ramdisk_path || 'configs/ramdisk.cpio' }}"
+          test -f "$RAMDISK"
+
+          cp "$RAMDISK" ramdisk.cpio
+          if file ramdisk.cpio | grep -qi 'gzip compressed'; then
+            mv ramdisk.cpio ramdisk.cpio.gz
+          else
+            gzip -f ramdisk.cpio
+          fi
+          ls -lah ramdisk.cpio.gz
+
+      - name: Make boot.img (match stock header v0 layout)
+        run: |
+          set -eux
+
+          CMDLINE="${{ github.event.inputs.cmdline || 'ehci-hcd.park=3 lpm_levels.sleep_disabled=1 sched_enable_hmp=0 sched_enable_power_aware=1 service_locator.enable=1 swiotlb=2048 androidboot.configfs=true androidboot.usbcontroller=a800000.dwc3 loop.max_part=7 androidboot.hardware=maple buildvariant=userdebug' }}"
+          OS_VERSION="${{ github.event.inputs.os_version || '13.0.0' }}"
+          OS_PATCH_LEVEL="${{ github.event.inputs.os_patch_level || '2023-12' }}"
+
+          test -n "${KERNEL_IMG}"
+          test -f "${KERNEL_IMG}"
+          test -f "ramdisk.cpio.gz"
+
+          mkbootimg --help | grep -E "kernel_offset|ramdisk_offset|tags_offset|base|pagesize|header_version" -n || true
+
+          mkbootimg \
+            --header_version "${STOCK_HEADER_VERSION}" \
+            --pagesize "${STOCK_PAGESIZE}" \
+            --os_version "${OS_VERSION}" \
+            --os_patch_level "${OS_PATCH_LEVEL}" \
+            --cmdline "${CMDLINE}" \
+            --base "${STOCK_BASE}" \
+            --kernel_offset "${STOCK_KERNEL_OFFSET}" \
+            --ramdisk_offset "${STOCK_RAMDISK_OFFSET}" \
+            --tags_offset "${STOCK_TAGS_OFFSET}" \
+            --kernel "${KERNEL_IMG}" \
+            --ramdisk "ramdisk.cpio.gz" \
+            --output "boot.img"
+
+          ls -lah boot.img
+
+      - name: Pack artifacts
+        if: always()
+        run: |
+          set -e
+          mkdir -p artifacts
+
+          cp -v build.log artifacts/ || true
+          cp -v out/.config artifacts/ || true
+
+          cp -v out/arch/arm64/boot/Image.gz-dtb artifacts/ || true
+          cp -v out/arch/arm64/boot/Image.gz artifacts/ || true
+          cp -v out/arch/arm64/boot/Image artifacts/ || true
+
+          cp -v boot.img artifacts/ || true
+
+          echo "===== build.log (last 200 lines) ====="
+          tail -n 200 build.log || true
+
+          zip -FSr "maple_boot_${{ github.run_id }}.zip" artifacts
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: maple-boot-${{ github.run_id }}
+          path: maple_boot_${{ github.run_id }}.zip
