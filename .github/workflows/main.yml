@@ -2,13 +2,13 @@ name: Build boot.img (maple / msm8998, gcc6)
 
 on:
   push:
-    branches: [ "lineage-21", "main", "master" ]
+    branches: [ "lineage-20", "main", "master" ]
   workflow_dispatch:
     inputs:
       device_ref:
         description: "android_device_sony_maple ref (optional)"
         required: false
-        default: "lineage-21"
+        default: "lineage-20"
       ramdisk_path:
         description: "Path to ramdisk cpio in THIS kernel repo"
         required: false
